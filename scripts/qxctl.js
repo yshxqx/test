@@ -11,8 +11,8 @@
  */
 
 const CFG = {
-  owner: 'YOUR_NAME',
-  repo: 'qxctl',
+  owner: 'yshxqx',
+  repo: 'test',
   branch: 'main',
   token: '$GITHUB_TOKEN_QX',   // 建议写成读取自 $prefs 的方式，见下方 loadToken()
   cmdPath: 'json/cmd.json',
