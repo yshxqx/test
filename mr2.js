@@ -188,7 +188,9 @@ function main() {
     return $done({});
   }
 
-  var finalBody = JSON.stringify({ code: wrapper.code, data: out });
+  // 关键：必须保留外层的 hash/msg/time/tip，客户端靠 hash:true 判断要解密
+  wrapper.data = out;
+  var finalBody = JSON.stringify(wrapper);
   log('完成，输出 ' + finalBody.length + ' 字节');
   $done({ body: finalBody });
 }
