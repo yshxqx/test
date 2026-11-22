@@ -1,149 +1,98 @@
 /*
- * qxctl.js — Quantumult X 指令执行器
+ * qxctl.js — Quantumult X 指令执行器（v2，无 token 版）
  *
- * 作为 QX 远程资源定时拉取（cron）。每轮：
- *   1. 拉取 cmd.json（指令箱）
- *   2. 若未执行过（seq 递增 且 ack=false 且未过期）→ 逐条执行
- *   3. 结果 POST 回 out/result.json，并把 cmd.json 标记 ack=true
+ * 原理：
+ *   QX 定时拉取本脚本 → 从公开仓库读 json/cmd.json → 执行指令
+ *   → 把结果 POST 到匿名上报通道 → Agent 直接读取
  *
- * 配置：在 QX 设置中把下面三个常量改成你的值，或通过 Rewrite 注入。
- * 依赖：GitHub PAT（Contents: Read and write）
+ * 为什么不用 GitHub token：
+ *   1. GitHub raw 会 404 屏蔽 ?token= 参数名
+ *   2. QX 定时任务里 $request 是 undefined，读不到 URL 参数
+ *   3. 结果写回仓库必须有 token，而 token 无处安放
+ *   → 改成匿名上报，彻底不碰凭据
+ *
+ * 去重：用 $prefs 记住最后执行过的 cmd.id，避免 cron 每轮重复执行
  */
 
 const CFG = {
   owner: 'yshxqx',
   repo: 'test',
   branch: 'main',
-  token: '$GITHUB_TOKEN_QX',   // 建议写成读取自 $prefs 的方式，见下方 loadToken()
   cmdPath: 'json/cmd.json',
-  outPath: 'json/out/result.json',
+
+  // 匿名上报通道（ntfy.sh）。主题名相当于密码，别外泄。
+  reportUrl: 'https://ntfy.sh/qxctl-q6j2anbmhj50wey661809tbn',
+
   timeout: 12000,
 };
 
-// ---------------------------------------------------------------- 基础设施
+// ---------------------------------------------------------------- 基础
 
-function loadToken() {
-  // 优先从 QX 本地存储读取，避免 token 硬编码在脚本里被 remote 缓存泄露
+function log(...a) {
+  try { console.log(a.map(String).join(' ')); } catch (_) {}
+}
+
+function notify(title, body, sub) {
   try {
-    const t = $prefs.valueForKey('qxctl_token');
-    if (t) return t;
-  } catch (e) {}
-  return CFG.token;
+    if (typeof $notify !== 'undefined') $notify(title, sub || '', body || '');
+  } catch (_) {}
 }
 
-function apiUrl(path) {
-  return `https://api.github.com/repos/${CFG.owner}/${CFG.repo}/contents/${path}`;
-}
-
-function ghHeaders(token) {
-  return {
-    'Authorization': `Bearer ${token}`,
-    'Accept': 'application/vnd.github+json',
-    'X-GitHub-Api-Version': '2022-11-28',
-    'User-Agent': 'qxctl',
-    'Content-Type': 'application/json',
-  };
-}
-
-function b64decode(s) {
-  // QX 环境没有 atob 时用 Buffer（NOS 提供）
-  s = (s || '').replace(/\n/g, '');
-  try { return Buffer.from(s, 'base64').toString('utf8'); } catch (e) {}
-  try { return decodeURIComponent(escape(atob(s))); } catch (e) {}
-  return '';
-}
-
-function b64encode(str) {
-  try { return Buffer.from(str, 'utf8').toString('base64'); } catch (e) {}
-  return btoa(unescape(encodeURIComponent(str)));
-}
-
-async function ghFetch(opts, label) {
+async function fetchText(opts, label) {
   let r;
   try {
     r = await $task.fetch(opts);
   } catch (e) {
-    const m = (e && (e.message || e.error || e.reason)) || String(e) || '未知网络错误';
+    const m = (e && (e.message || e.error)) || String(e) || '未知网络错误';
     throw new Error(`${label} 请求异常: ${m}`);
   }
-  // QX 在失败时可能返回 { error: ... } 而不抛异常
   if (!r) throw new Error(`${label} 无响应`);
   if (r.error) throw new Error(`${label} 网络失败: ${JSON.stringify(r.error).slice(0, 200)}`);
   if (typeof r.statusCode === 'undefined') {
-    throw new Error(`${label} 响应缺少 statusCode: ${String(r.body || JSON.stringify(r)).slice(0, 200)}`);
+    throw new Error(`${label} 响应缺少 statusCode`);
   }
   return r;
 }
 
-async function ghGet(path, token) {
-  // 公开仓库读取不需要鉴权：无 token 时改用 raw 地址（无缓存干扰时优）
-  if (!token) {
-    const raw = `https://raw.githubusercontent.com/${CFG.owner}/${CFG.repo}/${CFG.branch}/${path}?t=${Date.now()}`;
-    const r = await ghFetch({ url: raw, method: 'GET', opts: { timeout: CFG.timeout } }, `GET ${path}`);
-    if (r.statusCode === 404) return null;
-    if (r.statusCode !== 200) {
-      throw new Error(`GET ${path} -> ${r.statusCode}（无 token 只读模式）`);
-    }
-    return { content: r.body, sha: null, raw: null };
-  }
-
-  const r = await ghFetch({
-    url: apiUrl(path),
-    method: 'GET',
-    headers: ghHeaders(token),
-    opts: { timeout: CFG.timeout },
-  }, `GET ${path}`);
-
-  if (r.statusCode === 404) return null;
-  if (r.statusCode === 401) throw new Error('GET 401：token 无效或权限不足（需要 Contents: Read）');
-  if (r.statusCode === 403) throw new Error('GET 403：可能触发了限流，或 token 对该仓库无权限');
-  if (r.statusCode !== 200) {
-    throw new Error(`GET ${path} -> ${r.statusCode}: ${String(r.body || '').slice(0, 160)}`);
-  }
-
-  let j;
+async function readCmd() {
+  const url = `https://raw.githubusercontent.com/${CFG.owner}/${CFG.repo}/${CFG.branch}/${CFG.cmdPath}?t=${Date.now()}`;
+  const r = await fetchText({ url, method: 'GET', opts: { timeout: CFG.timeout } }, '读取指令');
+  if (r.statusCode === 404) throw new Error(`指令文件不存在: ${CFG.cmdPath}`);
+  if (r.statusCode !== 200) throw new Error(`读取指令 -> HTTP ${r.statusCode}`);
   try {
-    j = JSON.parse(r.body);
+    return JSON.parse(r.body);
   } catch (e) {
-    throw new Error(`GET ${path} 返回非 JSON: ${String(r.body || '').slice(0, 160)}`);
+    throw new Error('指令 JSON 解析失败: ' + String(r.body).slice(0, 120));
   }
-  return { content: b64decode(j.content), sha: j.sha, raw: j };
 }
 
-async function ghPut(path, contentStr, token, sha, message) {
-  const body = {
-    message: message || `qxctl: update ${path}`,
-    content: b64encode(contentStr),
-    branch: CFG.branch,
-  };
-  if (sha) body.sha = sha;
-  const r = await ghFetch({
-    url: apiUrl(path),
-    method: 'PUT',
-    headers: ghHeaders(token),
-    body: JSON.stringify(body),
-    opts: { timeout: CFG.timeout },
-  }, `PUT ${path}`);
-
-  if (r.statusCode === 401) throw new Error('PUT 401：token 需要 Contents: Read and write');
-  if (r.statusCode === 409) {
-    // sha 冲突：说明文件同时被改过，重读一次即可
-    throw new Error(`PUT ${path} 409：版本冲突，稍后重试`);
+async function report(payload) {
+  const body = JSON.stringify(payload);
+  try {
+    const r = await fetchText({
+      url: CFG.reportUrl,
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Title': 'qxctl' },
+      body,
+      opts: { timeout: CFG.timeout },
+    }, '上报结果');
+    if (r.statusCode >= 300) throw new Error(`HTTP ${r.statusCode}`);
+    return true;
+  } catch (e) {
+    log('上报失败: ' + (e && e.message ? e.message : String(e)));
+    log('完整结果: ' + body);
+    return false;
   }
-  if (r.statusCode >= 300) {
-    throw new Error(`PUT ${path} -> ${r.statusCode}: ${String(r.body || '').slice(0, 160)}`);
-  }
-  return true;
 }
 
-// ---------------------------------------------------------------- QX 能力封装
+// ---------------------------------------------------------------- QX 能力
 
 function sendMessage(msg) {
   return new Promise((resolve) => {
     try {
       $configuration.sendMessage(msg).then(
-        (r) => resolve({ ok: !!(r && r.ret !== undefined ? r.ret === true || r.ret !== null : true), data: r }),
-        (e) => resolve({ ok: false, error: String(e) }),
+        (r) => resolve({ ok: true, ret: r && typeof r.ret !== 'undefined' ? r.ret : r }),
+        (e) => resolve({ ok: false, error: String((e && e.message) || e) }),
       );
     } catch (e) {
       resolve({ ok: false, error: String(e) });
@@ -151,73 +100,56 @@ function sendMessage(msg) {
   });
 }
 
-// ---------------------------------------------------------------- 指令实现
-
 const OPS = {
-  async 'query.status'() {
-    const r = await sendMessage({ action: 'get_running_mode' });
-    return { running: r };
+  'query.status': async () => {
+    const mode = await sendMessage({ action: 'get_running_mode' });
+    return { running_mode: mode };
   },
 
-  async 'policy.get'(args) {
+  'policy.get': async () => {
     const r = await sendMessage({ action: 'get_customized_policy' });
     return { groups: r };
   },
 
-  async 'policy.set'(args) {
-    if (!args.group || !args.node) return { error: '需要 group 与 node' };
+  'policy.set': async (args) => {
+    if (!args || !args.group || !args.node) {
+      return { error: '需要 group 与 node 两个参数' };
+    }
     const r = await sendMessage({
       action: 'set_policy_state',
       content: { [args.group]: args.node },
     });
-    return { applied: args, result: r };
-  },
-
-  async 'capture.set'(args) {
-    const r = await sendMessage({ action: 'get_running_mode' });
-    return {
-      note: 'HTTP Analyzer 开关在 QX 中没有公开的 sendMessage 接口',
-      requested: !!args.enabled,
-      probe: r,
-    };
-  },
-
-  async 'capture.dump'(args) {
-    return {
-      note: '需配合 HTTP Analyzer 导出；QX JS 环境无法直接枚举历史请求',
-      requested: args,
-    };
+    return { applied: { group: args.group, node: args.node }, result: r };
   },
 };
 
 async function runCommand(c) {
   const key = c.target ? `${c.op}.${c.target}` : c.op;
   const fn = OPS[key];
-  if (!fn) return { op: key, ok: false, error: `未实现的操作: ${key}` };
+  if (!fn) return { op: key, ok: false, error: `未实现: ${key}` };
   try {
     const out = await fn(c.args || {});
     return { op: key, ok: !(out && out.error), result: out };
   } catch (e) {
-    return { op: key, ok: false, error: String(e) };
+    return { op: key, ok: false, error: String((e && e.message) || e) };
   }
 }
 
 // ---------------------------------------------------------------- 主流程
 
 async function main() {
-  const tokenRaw = loadToken();
-  const hasToken = !!(tokenRaw && !tokenRaw.startsWith('$'));
+  const cmd = await readCmd();
 
-  const cmdFile = await ghGet(CFG.cmdPath, hasToken ? tokenRaw : null);
-  if (!cmdFile) throw new Error(`指令文件不存在: ${CFG.cmdPath}`);
-  let cmd;
-  try { cmd = JSON.parse(cmdFile.content); } catch (e) { throw new Error('指令 JSON 解析失败'); }
-
-  // 幂等：已 ack / 已过期 → 直接返回
-  if (cmd.ack === true) return { skipped: 'ack', seq: cmd.seq };
+  // 去重：同一个 id 只执行一次（$prefs 无则忽略）
+  let lastId = null;
+  try { lastId = $prefs.valueForKey('qxctl_last'); } catch (_) {}
+  if (lastId && lastId === cmd.id) {
+    return { skipped: 'already-run', id: cmd.id };
+  }
+  if (cmd.ack === true) return { skipped: 'ack', id: cmd.id };
   if (cmd.expires_at) {
     const exp = Date.parse(cmd.expires_at);
-    if (!isNaN(exp) && Date.now() > exp) return { skipped: 'expired', seq: cmd.seq };
+    if (!isNaN(exp) && Date.now() > exp) return { skipped: 'expired', id: cmd.id };
   }
 
   const results = [];
@@ -225,60 +157,38 @@ async function main() {
     results.push(await runCommand(c));
   }
 
-  // 无 token：只读模式，结果走通知和日志，不回写
-  if (!hasToken) {
-    const brief = results
-      .map((r) => `${r.ok ? '✓' : '✗'} ${r.op}`)
-      .join('\n');
-    const detail = JSON.stringify(results).slice(0, 300);
-    console.log('qxctl (只读模式) 结果: ' + JSON.stringify(results));
-    if (typeof $notify !== 'undefined') {
-      try { $notify('qxctl 只读模式', `${results.length} 条指令已执行`, brief); } catch (_) {}
-    }
-    return { mode: 'readonly', seq: cmd.seq, count: results.length, detail };
-  }
-
-  const now = new Date().toISOString();
-  const out = {
-    version: 1,
+  const payload = {
     cmd_id: cmd.id,
     seq: cmd.seq,
-    executed_at: now,
+    executed_at: new Date().toISOString(),
     results,
   };
 
-  // 回写结果
-  const outExisting = await ghGet(CFG.outPath, tokenRaw);
-  await ghPut(CFG.outPath, JSON.stringify(out, null, 2), tokenRaw,
-    outExisting ? outExisting.sha : null, `qxctl: result for ${cmd.id}`);
+  const sent = await report(payload);
 
-  // 回写 ack，防止重复执行
-  cmd.ack = true;
-  cmd.acked_at = now;
-  await ghPut(CFG.cmdPath, JSON.stringify(cmd, null, 2), tokenRaw,
-    cmdFile.sha, `qxctl: ack ${cmd.id}`);
+  try { $prefs.setValueForKey(cmd.id, 'qxctl_last'); } catch (_) {}
 
-  return out;
+  const okCount = results.filter((r) => r.ok).length;
+  notify(
+    `qxctl ${okCount}/${results.length} 成功`,
+    results.map((r) => `${r.ok ? '✓' : '✗'} ${r.op}`).join('\n'),
+    sent ? '已上报' : '上报失败，见日志',
+  );
+
+  log('qxctl done: ' + JSON.stringify(payload).slice(0, 500));
+  return payload;
 }
 
 main()
   .then((r) => {
-    console.log('qxctl done: ' + JSON.stringify(r).slice(0, 400));
+    log('qxctl exit: ' + JSON.stringify(r).slice(0, 300));
     $done({});
   })
   .catch((e) => {
-    // QX 里 stack 常为空，优先输出可读的 message
-    let msg;
-    if (e && e.message) msg = e.message;
-    else if (e && e.error) msg = typeof e.error === 'string' ? e.error : JSON.stringify(e.error);
-    else if (typeof e === 'string') msg = e;
-    else {
-      try { msg = JSON.stringify(e); } catch (_) { msg = String(e); }
-    }
-    if (!msg || msg === 'undefined' || msg === '{}') msg = '未知错误（无错误信息）';
-    console.log('qxctl error: ' + msg);
-    if (typeof $notify !== 'undefined') {
-      try { $notify('qxctl 执行失败', msg.slice(0, 200)); } catch (_) {}
-    }
+    let msg = (e && e.message) || (typeof e === 'string' ? e : '');
+    if (!msg) { try { msg = JSON.stringify(e); } catch (_) { msg = String(e); } }
+    if (!msg || msg === '{}') msg = '未知错误';
+    log('qxctl error: ' + msg);
+    notify('qxctl 执行失败', msg.slice(0, 300));
     $done({});
   });
