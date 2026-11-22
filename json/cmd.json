@@ -1,9 +1,9 @@
 {
   "version": 1,
-  "seq": 0,
-  "id": "cmd-0-init",
-  "issued_at": "2026-11-22T10:40:00Z",
-  "expires_at": "2026-11-23T10:40:00Z",
+  "seq": 1,
+  "id": "cmd-1-init",
+  "issued_at": "2026-11-22T10:52:18Z",
+  "expires_at": "",
   "ack": false,
   "commands": [
     { "op": "query", "target": "status" },
