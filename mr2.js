@@ -140,7 +140,11 @@ function patchVideoPlay(j) {
   p.needVip = false;
   p.needCoin = false;
   p.previewTime = 0;
+  p.previewStart = 0;
+  p.startAt = 0;
   p.freeTime = 0;
+  p.mask = null;
+  p.coinPrivilege = null;
   if (p.access) {
     p.access.reason = '';
     p.access.price = null;
