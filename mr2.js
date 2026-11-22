@@ -127,10 +127,16 @@ function patchVideoPlay(j) {
   // 先记下原始状态，方便判断锁在哪
   log('playPolicy 原值: result=' + p.result + ' status=' + p.statusType +
       ' needVip=' + p.needVip + ' needCoin=' + p.needCoin +
-      ' srcLen=' + ((p.source || '').length));
+      ' srcLen=' + ((p.source || '').length) +
+      ' src=' + String(p.source || '').slice(0, 40));
+
+  // 锁住时把完整结构打出来，方便比对还差什么
+  if (p.result !== 'FULL') {
+    log('完整 playPolicy: ' + JSON.stringify(p).slice(0, 900));
+  }
 
   p.result = 'FULL';
-  p.statusType = 'FREE';
+  p.statusType = 'FREE_REMAIN';
   p.needVip = false;
   p.needCoin = false;
   p.previewTime = 0;
