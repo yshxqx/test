@@ -76,6 +76,17 @@ async function ghFetch(opts, label) {
 }
 
 async function ghGet(path, token) {
+  // 公开仓库读取不需要鉴权：无 token 时改用 raw 地址（无缓存干扰时优）
+  if (!token) {
+    const raw = `https://raw.githubusercontent.com/${CFG.owner}/${CFG.repo}/${CFG.branch}/${path}?t=${Date.now()}`;
+    const r = await ghFetch({ url: raw, method: 'GET', opts: { timeout: CFG.timeout } }, `GET ${path}`);
+    if (r.statusCode === 404) return null;
+    if (r.statusCode !== 200) {
+      throw new Error(`GET ${path} -> ${r.statusCode}（无 token 只读模式）`);
+    }
+    return { content: r.body, sha: null, raw: null };
+  }
+
   const r = await ghFetch({
     url: apiUrl(path),
     method: 'GET',
@@ -194,10 +205,10 @@ async function runCommand(c) {
 // ---------------------------------------------------------------- 主流程
 
 async function main() {
-  const token = loadToken();
-  if (!token || token.startsWith('$')) throw new Error('未配置 token（$prefs qxctl_token）');
+  const tokenRaw = loadToken();
+  const hasToken = !!(tokenRaw && !tokenRaw.startsWith('$'));
 
-  const cmdFile = await ghGet(CFG.cmdPath, token);
+  const cmdFile = await ghGet(CFG.cmdPath, hasToken ? tokenRaw : null);
   if (!cmdFile) throw new Error(`指令文件不存在: ${CFG.cmdPath}`);
   let cmd;
   try { cmd = JSON.parse(cmdFile.content); } catch (e) { throw new Error('指令 JSON 解析失败'); }
@@ -214,6 +225,19 @@ async function main() {
     results.push(await runCommand(c));
   }
 
+  // 无 token：只读模式，结果走通知和日志，不回写
+  if (!hasToken) {
+    const brief = results
+      .map((r) => `${r.ok ? '✓' : '✗'} ${r.op}`)
+      .join('\n');
+    const detail = JSON.stringify(results).slice(0, 300);
+    console.log('qxctl (只读模式) 结果: ' + JSON.stringify(results));
+    if (typeof $notify !== 'undefined') {
+      try { $notify('qxctl 只读模式', `${results.length} 条指令已执行`, brief); } catch (_) {}
+    }
+    return { mode: 'readonly', seq: cmd.seq, count: results.length, detail };
+  }
+
   const now = new Date().toISOString();
   const out = {
     version: 1,
@@ -224,14 +248,14 @@ async function main() {
   };
 
   // 回写结果
-  const outExisting = await ghGet(CFG.outPath, token);
-  await ghPut(CFG.outPath, JSON.stringify(out, null, 2), token,
+  const outExisting = await ghGet(CFG.outPath, tokenRaw);
+  await ghPut(CFG.outPath, JSON.stringify(out, null, 2), tokenRaw,
     outExisting ? outExisting.sha : null, `qxctl: result for ${cmd.id}`);
 
   // 回写 ack，防止重复执行
   cmd.ack = true;
   cmd.acked_at = now;
-  await ghPut(CFG.cmdPath, JSON.stringify(cmd, null, 2), token,
+  await ghPut(CFG.cmdPath, JSON.stringify(cmd, null, 2), tokenRaw,
     cmdFile.sha, `qxctl: ack ${cmd.id}`);
 
   return out;
