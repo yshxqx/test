@@ -55,31 +55,20 @@ async function fetchText(opts, label) {
 }
 
 async function readCmd() {
-  // jsDelivr 支持主动清缓存（raw 的 CDN 缓存换 query 也刷不掉）
-  const bases = [
-    `https://cdn.jsdelivr.net/gh/${CFG.owner}/${CFG.repo}@${CFG.branch}/${CFG.cmdPath}`,
-    `https://raw.githubusercontent.com/${CFG.owner}/${CFG.repo}/${CFG.branch}/${CFG.cmdPath}`,
-  ];
-  let lastErr = null;
-  for (const base of bases) {
-    try {
-      const r = await fetchText({
-        url: `${base}?t=${Date.now()}`,
-        method: 'GET',
-        opts: { timeout: CFG.timeout },
-      }, '读取指令');
-      if (r.statusCode === 404) { lastErr = `指令文件不存在: ${CFG.cmdPath}`; continue; }
-      if (r.statusCode !== 200) { lastErr = `HTTP ${r.statusCode}`; continue; }
-      try {
-        return JSON.parse(r.body);
-      } catch (e) {
-        lastErr = '指令 JSON 解析失败: ' + String(r.body).slice(0, 120);
-      }
-    } catch (e) {
-      lastErr = (e && e.message) || String(e);
-    }
+  // 只用 raw。jsDelivr 对 @main 缓存极久且清不掉，会静默返回旧指令文件，比慢更危险。
+  const base = `https://raw.githubusercontent.com/${CFG.owner}/${CFG.repo}/${CFG.branch}/${CFG.cmdPath}`;
+  const r = await fetchText({
+    url: `${base}?t=${Date.now()}`,
+    method: 'GET',
+    opts: { timeout: CFG.timeout },
+  }, '读取指令');
+  if (r.statusCode === 404) throw new Error(`指令文件不存在: ${CFG.cmdPath}`);
+  if (r.statusCode !== 200) throw new Error(`读取指令 -> HTTP ${r.statusCode}`);
+  try {
+    return JSON.parse(r.body);
+  } catch (e) {
+    throw new Error('指令 JSON 解析失败: ' + String(r.body).slice(0, 120));
   }
-  throw new Error(lastErr || '读取指令失败');
 }
 
 async function report(payload) {
