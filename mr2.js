@@ -117,7 +117,36 @@ function patchMineInfo(j) {
 function patchVidInfo(j) {
   j.freeTime = 9999;
   j.watch = { watchCount: 0, isWatch: true, isFreeWatch: true };
-  return '解锁视频';
+  if (j.canUseFreeTrial === false) j.canUseFreeTrial = true;
+  if (typeof j.freeTrialRemaining === 'number') j.freeTrialRemaining = 9999;
+  return '解锁视频详情';
+}
+
+function patchVideoPlay(j) {
+  var p = j.playPolicy || {};
+  // 先记下原始状态，方便判断锁在哪
+  log('playPolicy 原值: result=' + p.result + ' status=' + p.statusType +
+      ' needVip=' + p.needVip + ' needCoin=' + p.needCoin +
+      ' srcLen=' + ((p.source || '').length));
+
+  p.result = 'FULL';
+  p.statusType = 'FREE';
+  p.needVip = false;
+  p.needCoin = false;
+  p.previewTime = 0;
+  p.freeTime = 0;
+  if (p.access) {
+    p.access.reason = '';
+    p.access.price = null;
+    p.access.coinBalance = null;
+    p.access.actions = [];
+  }
+  if (p.freeTrial) {
+    p.freeTrial.remain = 9999;
+    p.freeTrial.total = 9999;
+  }
+  j.playPolicy = p;
+  return '解锁播放';
 }
 
 // ================================ 主流程 ================================
@@ -174,6 +203,8 @@ function main() {
     msg = patchMineInfo(obj);
   } else if (url.indexOf('/api/app/vid/info') !== -1) {
     msg = patchVidInfo(obj);
+  } else if (url.indexOf('/api/app/video/play') !== -1) {
+    msg = patchVideoPlay(obj);
   } else {
     log('接口未定义改写，放行');
     return $done({});
