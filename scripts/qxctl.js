@@ -58,16 +58,44 @@ function b64encode(str) {
   return btoa(unescape(encodeURIComponent(str)));
 }
 
+async function ghFetch(opts, label) {
+  let r;
+  try {
+    r = await $task.fetch(opts);
+  } catch (e) {
+    const m = (e && (e.message || e.error || e.reason)) || String(e) || '未知网络错误';
+    throw new Error(`${label} 请求异常: ${m}`);
+  }
+  // QX 在失败时可能返回 { error: ... } 而不抛异常
+  if (!r) throw new Error(`${label} 无响应`);
+  if (r.error) throw new Error(`${label} 网络失败: ${JSON.stringify(r.error).slice(0, 200)}`);
+  if (typeof r.statusCode === 'undefined') {
+    throw new Error(`${label} 响应缺少 statusCode: ${String(r.body || JSON.stringify(r)).slice(0, 200)}`);
+  }
+  return r;
+}
+
 async function ghGet(path, token) {
-  const r = await $task.fetch({
+  const r = await ghFetch({
     url: apiUrl(path),
     method: 'GET',
     headers: ghHeaders(token),
     opts: { timeout: CFG.timeout },
-  });
+  }, `GET ${path}`);
+
   if (r.statusCode === 404) return null;
-  if (r.statusCode !== 200) throw new Error(`GET ${path} -> ${r.statusCode}`);
-  const j = JSON.parse(r.body);
+  if (r.statusCode === 401) throw new Error('GET 401：token 无效或权限不足（需要 Contents: Read）');
+  if (r.statusCode === 403) throw new Error('GET 403：可能触发了限流，或 token 对该仓库无权限');
+  if (r.statusCode !== 200) {
+    throw new Error(`GET ${path} -> ${r.statusCode}: ${String(r.body || '').slice(0, 160)}`);
+  }
+
+  let j;
+  try {
+    j = JSON.parse(r.body);
+  } catch (e) {
+    throw new Error(`GET ${path} 返回非 JSON: ${String(r.body || '').slice(0, 160)}`);
+  }
   return { content: b64decode(j.content), sha: j.sha, raw: j };
 }
 
@@ -78,14 +106,22 @@ async function ghPut(path, contentStr, token, sha, message) {
     branch: CFG.branch,
   };
   if (sha) body.sha = sha;
-  const r = await $task.fetch({
+  const r = await ghFetch({
     url: apiUrl(path),
     method: 'PUT',
     headers: ghHeaders(token),
     body: JSON.stringify(body),
     opts: { timeout: CFG.timeout },
-  });
-  if (r.statusCode >= 300) throw new Error(`PUT ${path} -> ${r.statusCode} ${String(r.body).slice(0, 200)}`);
+  }, `PUT ${path}`);
+
+  if (r.statusCode === 401) throw new Error('PUT 401：token 需要 Contents: Read and write');
+  if (r.statusCode === 409) {
+    // sha 冲突：说明文件同时被改过，重读一次即可
+    throw new Error(`PUT ${path} 409：版本冲突，稍后重试`);
+  }
+  if (r.statusCode >= 300) {
+    throw new Error(`PUT ${path} -> ${r.statusCode}: ${String(r.body || '').slice(0, 160)}`);
+  }
   return true;
 }
 
@@ -207,6 +243,18 @@ main()
     $done({});
   })
   .catch((e) => {
-    console.log('qxctl error: ' + String(e && e.stack ? e.stack : e));
+    // QX 里 stack 常为空，优先输出可读的 message
+    let msg;
+    if (e && e.message) msg = e.message;
+    else if (e && e.error) msg = typeof e.error === 'string' ? e.error : JSON.stringify(e.error);
+    else if (typeof e === 'string') msg = e;
+    else {
+      try { msg = JSON.stringify(e); } catch (_) { msg = String(e); }
+    }
+    if (!msg || msg === 'undefined' || msg === '{}') msg = '未知错误（无错误信息）';
+    console.log('qxctl error: ' + msg);
+    if (typeof $notify !== 'undefined') {
+      try { $notify('qxctl 执行失败', msg.slice(0, 200)); } catch (_) {}
+    }
     $done({});
   });
