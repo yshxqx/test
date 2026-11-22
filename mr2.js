@@ -145,10 +145,13 @@ function patchVideoPlay(j) {
   p.freeTime = 0;
   p.mask = null;
   p.coinPrivilege = null;
+  p.price = null;              // 顶层的价格对象也必须清掉
+  p.statusDesc = '';           // 去掉“金币解锁”之类的文案
   if (p.access) {
-    p.access.reason = '';
+    p.access.reason = 'ENTITLEMENT';   // 对齐可播样本的枚举值
     p.access.price = null;
     p.access.coinBalance = null;
+    p.access.checkoutContextId = '';
     p.access.actions = [];
   }
   if (p.freeTrial) {
