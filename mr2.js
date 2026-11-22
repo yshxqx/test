@@ -167,6 +167,11 @@ function main() {
     log('没有响应体，放行');
     return $done({});
   }
+  // 超大响应（如启动配置 322KB）解密极慢，直接放行避免 QX 超时
+  if (body.length > 120000) {
+    log('响应过大(' + body.length + ')，跳过');
+    return $done({});
+  }
 
   var rule = null;
   for (var i = 0; i < RULES.length; i++) {
