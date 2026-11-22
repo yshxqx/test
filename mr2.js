@@ -196,6 +196,22 @@ function main() {
   if (!rule) { log('域名未匹配，放行'); return $done({}); }
   log('匹配=' + rule.name);
 
+  // m3u8 播放列表：只统计片段数，不改内容
+  if (url.indexOf('/m3u8') !== -1 && body.indexOf('I0VY') === 0) {
+    try {
+      var pl = C.enc.Utf8.stringify(bytesToWordArray(b64ToBytes(body)));
+      var segs = pl.match(/#EXTINF:/g);
+      var total = 0;
+      pl.replace(/#EXTINF:([\d.]+)/g, function (m, v) { total += parseFloat(v); return m; });
+      log('m3u8 片段数=' + (segs ? segs.length : 0) +
+          ' 总时长=' + total.toFixed(1) + '秒' +
+          ' ENDLIST=' + (pl.indexOf('#EXT-X-ENDLIST') !== -1));
+    } catch (e) {
+      log('m3u8 解析失败: ' + (e && e.message));
+    }
+    return $done({});
+  }
+
   var wrapper;
   try {
     wrapper = JSON.parse(body);
